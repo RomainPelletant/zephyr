@@ -6,3 +6,8 @@ description: GSM PPP modem
 compatible: "zephyr,gsm-ppp"
 
 include: uart-device.yaml
+
+properties:
+  mdm-dtr-gpios:
+    type: phandle-array
+    required: true

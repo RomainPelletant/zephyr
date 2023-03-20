@@ -1051,6 +1051,18 @@ static int ppp_start(const struct device *dev)
 	return 0;
 }
 
+static int ppp_resume(const struct device *dev)
+{
+	struct ppp_driver_context *context = dev->data;
+
+	uart_irq_rx_disable(context->dev);
+	uart_irq_tx_disable(context->dev);
+	ppp_uart_flush(context->dev);
+	uart_irq_callback_user_data_set(context->dev, ppp_uart_isr,
+					context);
+	uart_irq_rx_enable(context->dev);
+}
+
 static int ppp_stop(const struct device *dev)
 {
 	struct ppp_driver_context *context = dev->data;
@@ -1069,6 +1081,7 @@ static const struct ppp_api ppp_if_api = {
 #if defined(CONFIG_NET_STATISTICS_PPP)
 	.get_stats = ppp_get_stats,
 #endif
+	.resume = ppp_resume,
 };
 
 NET_DEVICE_INIT(ppp, CONFIG_NET_PPP_DRV_NAME, ppp_driver_init,

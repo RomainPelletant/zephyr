@@ -60,6 +60,9 @@ struct ppp_api {
 	 */
 	struct net_stats_ppp *(*get_stats)(const struct device *dev);
 #endif
+
+	/** Go back to PPP mode */
+	int (*resume)(const struct device *dev);
 };
 
 /* Make sure that the network interface API is properly setup inside

@@ -123,6 +123,19 @@ NET_BUF_POOL_DEFINE(gsm_recv_pool, GSM_RECV_MAX_BUF, GSM_RECV_BUF_SIZE, 0, NULL)
 K_KERNEL_STACK_DEFINE(gsm_rx_stack, CONFIG_MODEM_GSM_RX_STACK_SIZE);
 K_KERNEL_STACK_DEFINE(gsm_workq_stack, CONFIG_MODEM_GSM_WORKQ_STACK_SIZE);
 
+#if DT_INST_NODE_HAS_PROP(0, mdm_dtr_gpios)
+static const struct gpio_dt_spec dtr_gpio = GPIO_DT_SPEC_INST_GET(0, mdm_dtr_gpios);
+
+static void set_dtr(bool state)
+{
+	if (state) {
+		gpio_pin_configure_dt(&dtr_gpio, GPIO_OUTPUT_HIGH);
+	} else {
+		gpio_pin_configure_dt(&dtr_gpio, GPIO_OUTPUT_LOW);
+	}
+}
+#endif
+
 static inline void gsm_ppp_lock(struct gsm_modem *gsm)
 {
 	(void)k_mutex_lock(&gsm->lock, K_FOREVER);
@@ -497,8 +510,9 @@ static const struct setup_cmd setup_modem_info_cmds[] = {
 static const struct setup_cmd setup_cmds[] = {
 	/* no echo */
 	SETUP_CMD_NOHANDLE("ATE0"),
+	SETUP_CMD_NOHANDLE("AT&D1"),
 	/* hang up */
-	SETUP_CMD_NOHANDLE("ATH"),
+	// SETUP_CMD_NOHANDLE("ATH"),
 	/* extended errors in numeric form */
 	SETUP_CMD_NOHANDLE("AT+CMEE=1"),
 	/* disable unsolicited network registration codes */
@@ -613,6 +627,61 @@ static struct net_if *ppp_net_if(void)
 	return net_if_get_first_by_type(&NET_L2_GET_NAME(PPP));
 }
 
+static int switch_back_to_ppp_command(struct gsm_modem *gsm)
+{
+	static const struct ppp_api *api;
+	const struct device *ppp_dev = device_get_binding(CONFIG_NET_PPP_DRV_NAME);
+	int ret;
+
+	ret = modem_cmd_send_ext(&gsm->context.iface, &gsm->context.cmd_handler, &response_cmds[0],
+					    ARRAY_SIZE(response_cmds),
+				 "ATO0", &gsm->sem_response, GSM_CMD_SETUP_TIMEOUT, 0);
+
+	if (ret != 0) {
+		LOG_ERR("Failed to send ATO0 cmd, ret %d", ret);
+	}
+
+	if (ppp_dev == NULL) {
+		LOG_ERR("Cannot find PPP %s!", CONFIG_NET_PPP_DRV_NAME);
+		return -EFAULT;
+	}
+
+	if (api == NULL) {
+		api = (const struct ppp_api *)ppp_dev->api;
+
+		/* For the first call, we want to call ppp_start()... */
+		ret = api->resume(ppp_dev);
+		if (ret < 0) {
+			LOG_ERR("ppp start returned %d", ret);
+		}
+	} else {
+		ret = api->resume(ppp_dev);
+		if (ret < 0) {
+			LOG_ERR("ppp start returned %d", ret);
+		}
+	}
+	return ret;
+}
+
+static int switch_to_at_command(struct gsm_modem *gsm)
+{
+	int ret = modem_iface_uart_init_dev(&gsm->context.iface, DEVICE_DT_GET(GSM_UART_NODE));
+	if (ret < 0) {
+		gsm->state = GSM_PPP_STATE_ERROR;
+		LOG_ERR("modem_iface_uart_init returned %d", ret);
+		return ret;
+	}
+
+	set_dtr(true);
+
+	ret = modem_cmd_send_ext(&gsm->context.iface, &gsm->context.cmd_handler, &response_cmds[0],
+					    ARRAY_SIZE(response_cmds), "", &gsm->sem_response, GSM_CMD_SETUP_TIMEOUT, 0);
+
+	set_dtr(false);
+
+	return ret;
+}
+
 static void set_ppp_carrier_on(struct gsm_modem *gsm)
 {
 	static const struct ppp_api *api;
@@ -677,6 +746,10 @@ static void rssi_handler(struct k_work *work)
 	struct gsm_modem *gsm = CONTAINER_OF(dwork, struct gsm_modem, rssi_work_handle);
 
 	gsm_ppp_lock(gsm);
+#if defined(CONFIG_MODEM_GSM_SWITCH_AT_MODE)
+	switch_to_at_command(gsm);
+#endif
+
 	query_rssi_lock(gsm);
 
 #if defined(CONFIG_MODEM_CELL_INFO)
@@ -684,6 +757,9 @@ static void rssi_handler(struct k_work *work)
 #endif
 	(void)gsm_work_reschedule(&gsm->rssi_work_handle,
 				  K_SECONDS(CONFIG_MODEM_GSM_RSSI_POLLING_PERIOD));
+#if defined(CONFIG_MODEM_GSM_SWITCH_AT_MODE)
+	switch_back_to_ppp_command(gsm);
+#endif
 	gsm_ppp_unlock(gsm);
 }
 
@@ -884,6 +960,12 @@ attaching:
 		}
 
 		modem_cmd_handler_tx_unlock(&gsm->context.cmd_handler);
+		if (gsm->state != GSM_PPP_STATE_ERROR) {
+			(void)gsm_work_reschedule(&gsm->rssi_work_handle,
+						K_SECONDS(CONFIG_MODEM_GSM_RSSI_POLLING_PERIOD));
+		}
+	} else if(IS_ENABLED(CONFIG_MODEM_GSM_SWITCH_AT_MODE)) {
+		LOG_INF("Launch RSSI Polling");
 		if (gsm->state != GSM_PPP_STATE_ERROR) {
 			(void)gsm_work_reschedule(&gsm->rssi_work_handle,
 						K_SECONDS(CONFIG_MODEM_GSM_RSSI_POLLING_PERIOD));
@@ -1322,6 +1404,14 @@ static int gsm_init(const struct device *dev)
 		LOG_DBG("context error %d", ret);
 		return ret;
 	}
+	
+#if DT_INST_NODE_HAS_PROP(0, mdm_dtr_gpios)
+	ret = gpio_pin_configure_dt(&dtr_gpio, GPIO_OUTPUT_LOW);
+	if (ret < 0) {
+		LOG_ERR("Failed to configure %s pin", "dtr");
+		return ret;
+	}
+#endif
 
 	/* Initialize to stop state so that it can be started later */
 	gsm->state = GSM_PPP_STOP;
@@ -1343,7 +1433,7 @@ static int gsm_init(const struct device *dev)
 			   K_PRIO_COOP(7), NULL);
 	(void)k_thread_name_set(&gsm->workq.thread, "gsm_workq");
 
-	if (IS_ENABLED(CONFIG_GSM_MUX)) {
+	if (IS_ENABLED(CONFIG_GSM_MUX) || IS_ENABLED(CONFIG_MODEM_GSM_SWITCH_AT_MODE)) {
 		k_work_init_delayable(&gsm->rssi_work_handle, rssi_handler);
 	}
 
@@ -1364,5 +1454,34 @@ static int gsm_init(const struct device *dev)
 	return 0;
 }
 
+int request_cmd(void)
+{
+	struct gsm_modem *pgsm = &gsm;
+	int ret = 0;
+
+	if (pgsm->state == GSM_PPP_STATE_ERROR) {
+		LOG_ERR("PPP error state");
+		return -ENODEV;
+	}
+
+	gsm_ppp_lock(pgsm);
+
+	ret = switch_to_at_command(pgsm);
+	if (ret != 0) {
+		LOG_ERR("Failed to switch AT cmds, ret %d", ret);
+		return ret;
+	}
+
+	ret = modem_cmd_send_ext(&pgsm->context.iface, &pgsm->context.cmd_handler, &read_rssi_cmd, 1,
+				 "AT+CESQ", &pgsm->sem_response, GSM_CMD_SETUP_TIMEOUT, 0);
+
+	ret = switch_back_to_ppp_command(pgsm);
+
+	gsm_ppp_unlock(pgsm);
+
+	return ret;
+}
+
 DEVICE_DT_DEFINE(DT_DRV_INST(0), gsm_init, NULL, &gsm, NULL,
 		 POST_KERNEL, CONFIG_MODEM_GSM_INIT_PRIORITY, NULL);
+

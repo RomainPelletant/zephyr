@@ -118,4 +118,12 @@ config MODEM_GSM_FACTORY_RESET_AT_BOOT
 	  helpful if your modem has a tendency to get stuck due to cached
 	  state.
 
+config MODEM_GSM_SWITCH_AT_MODE
+	bool "Modem support DTR pin to switch AT mode"
+	help
+	  If this is enabled, the modem will be reset to factory default
+	  settings first thing in the initialization sequence. This is
+	  helpful if your modem has a tendency to get stuck due to cached
+	  state.
+
 endif
